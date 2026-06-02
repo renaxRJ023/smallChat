@@ -12,8 +12,15 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.use(cors({ origin: '*' }));
 import { DataTypes, Sequelize, where, Op } from 'sequelize';
 
+console.log('DB_HOST:', process.env.DB_NAME);
+console.log('DB_NAME:', process.env.DB_USERNAME);
+console.log('DB_NAME:', process.env.DB_PASSWORD);
+console.log('DB_NAME:', process.env.DB_HOST);
+console.log('DB_NAME:', process.env.DB_PORT);
+
 const sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_USERNAME, process.env.DB_PASSWORD, {
     host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
     dialect: 'mysql',
     logging: false
 });
