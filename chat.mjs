@@ -1,215 +1,248 @@
-import dotenv from 'dotenv';
-dotenv.config();
+import env from './config/env.config.mjs';
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 
 const app = express();
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: '*' }));
-import { DataTypes, Sequelize, where, Op } from 'sequelize';
 
-console.log('DB_HOST:', process.env.DB_NAME);
-console.log('DB_NAME:', process.env.DB_USERNAME);
-console.log('DB_NAME:', process.env.DB_PASSWORD);
-console.log('DB_NAME:', process.env.DB_HOST);
-console.log('DB_NAME:', process.env.DB_PORT);
+import db from './models/index.mjs'
 
-const sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_USERNAME, process.env.DB_PASSWORD, {
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
-    dialect: 'mysql',
-    logging: false
-});
-
-const Users = sequelize.define('users', {
-    username: {
-        type: DataTypes.STRING,
-        allowNull: false,
-        unique: true
-    },
-    isOnline: {
-        type: DataTypes.BOOLEAN,
-        defaultValue: false
-    }
-});
-
-const Messages = sequelize.define('messages', {
-    senderId: {
-        type: DataTypes.INTEGER,
-        allowNull: false
-    },
-    receiverId: {
-        type: DataTypes.INTEGER,
-        allowNull: false
-    },
-    text: {
-        type: DataTypes.TEXT,
-        allowNull: false,
-    },
-    status: {
-        type: DataTypes.ENUM('sent', 'delivered', 'read'),
-        defaultValue: 'sent'
-    }
-});
-
-Users.hasMany(Messages, { as: 'SentMessages', foreignKey: 'senderId' });
-Users.hasMany(Messages, { as: 'ReceivedMessages', foreignKey: 'receiverId' });
-Messages.belongsTo(Users, { as: 'Sender', foreignKey: 'senderId' });
-Messages.belongsTo(Users, { as: 'Receiver', foreignKey: 'receiverId' });
-
-(async () => {
-    try {
-        await sequelize.authenticate();
-        await sequelize.sync();
-
-        console.log('Database connected successfully');
-    } catch (err) {
-        console.error(err);
-    }
-})();
-
-function avatarText(name) {
-    const fname = name.split(' ')[0];
-    const lname = name.split(' ')[1];
-    return `${fname.slice(0, 1)}${lname.slice(0, 1)}`;
+try {
+    await db.sequelize.authenticate();
+    await db.sequelize.sync();
+} catch (err) {
+    console.error('Startup failed:', err);
 }
 
-app.get('/getusers/:id', async (req, res) => {
-    try {
-        const currentUserId = req.params.id;
+import router from './routes/auth.routes.mjs';
+app.use(`/${env.APIPREFIX}`, router);
 
-        const users = await Users.findAll({
-            where: {
-                id: { [Op.ne]: currentUserId }
-            },
-            attributes: ['id', 'username', 'avatarColor', 'isOnline']
-        });
 
-        const formattedUsers = await Promise.all(users.map(async (user) => {
-            const userJson = user.toJSON();
+import { Op } from 'sequelize';
 
-            const lastMessageObj = await Messages.findOne({
+const { Messages, Users } = db;
+
+io.on('connection', (socket) => {
+
+    console.log('User connected:', socket.id);
+
+    /**
+     * User Connected
+     */
+    socket.on('user_connected', async (userId) => {
+        try {
+
+            socket.userId = userId;
+
+            // Join personal room
+            socket.join(`user_${userId}`);
+
+            await Users.update(
+                { isOnline: true },
+                {
+                    where: { id: userId }
+                }
+            );
+
+            io.emit('updateStatus', {
+                userId,
+                isOnline: true
+            });
+
+            console.log(`User ${userId} Online`);
+
+        } catch (err) {
+            console.error(err);
+        }
+    });
+
+    /**
+     * Typing Indicator
+     */
+    socket.on('typing', ({ senderId, receiverId }) => {
+
+        io.to(`user_${receiverId}`)
+            .emit('userTyping', {
+                senderId
+            });
+
+    });
+
+    /**
+     * Send Message
+     */
+    socket.on('send_message', async (payload) => {
+
+        try {
+
+            const {
+                senderId,
+                receiverId,
+                text
+            } = payload;
+
+            let status = 'sent';
+
+            // Check if receiver room has sockets
+            const receiverRoom =
+                io.sockets.adapter.rooms.get(`user_${receiverId}`);
+
+            const receiverOnline =
+                receiverRoom && receiverRoom.size > 0;
+
+            if (receiverOnline) {
+                status = 'delivered';
+            }
+
+            const savedMessage = await Messages.create({
+                senderId,
+                receiverId,
+                text,
+                status
+            });
+
+            const message = await Messages.findByPk(savedMessage.id);
+
+            io.to(`user_${senderId}`)
+                .emit('new_message', message);
+
+            io.to(`user_${receiverId}`)
+                .emit('new_message', message);
+
+        } catch (err) {
+
+            console.error('Send Message Error:', err);
+
+            socket.emit('error_message', {
+                message: 'Failed to send message'
+            });
+        }
+
+    });
+
+    /**
+     * Get Chat History
+     */
+    socket.on('load_chat', async ({ senderId, receiverId }) => {
+
+        try {
+
+            const history = await Messages.findAll({
                 where: {
                     [Op.or]: [
-                        { senderId: currentUserId, receiverId: userJson.id },
-                        { senderId: userJson.id, receiverId: currentUserId }
+                        {
+                            senderId,
+                            receiverId
+                        },
+                        {
+                            senderId: receiverId,
+                            receiverId: senderId
+                        }
                     ]
                 },
-                attributes: ['text', 'status', 'createdAt'],
-                order: [['createdAt', 'DESC']]
+                order: [
+                    ['createdAt', 'ASC']
+                ]
             });
 
-            const calculatedUnreadCount = await Messages.count({
-                where: {
-                    senderId: userJson.id,
-                    receiverId: currentUserId,
-                    status: {
-                        [Op.ne]: 'read'
+            socket.emit('chat_history', history);
+
+        } catch (err) {
+
+            console.error(err);
+
+            socket.emit('error_message', {
+                message: 'Failed to load chat'
+            });
+        }
+
+    });
+
+    /**
+     * Mark Message As Read
+     */
+    socket.on('message_read', async ({ messageId }) => {
+
+        try {
+
+            const message =
+                await Messages.findByPk(messageId);
+
+            if (!message) return;
+
+            await message.update({
+                status: 'read'
+            });
+
+            io.to(`user_${message.senderId}`)
+                .emit('message_read', {
+                    messageId
+                });
+
+        } catch (err) {
+            console.error(err);
+        }
+
+    });
+
+    /**
+     * Disconnect
+     */
+    socket.on('disconnect', async () => {
+
+        try {
+
+            const userId = socket.userId;
+
+            if (!userId) return;
+
+            // Check if user still has another tab/device connected
+            const room =
+                io.sockets.adapter.rooms.get(`user_${userId}`);
+
+            const stillConnected =
+                room && room.size > 0;
+
+            if (!stillConnected) {
+
+                await Users.update(
+                    {
+                        isOnline: false
+                    },
+                    {
+                        where: {
+                            id: userId
+                        }
                     }
-                }
-            });
+                );
 
-            return {
-                id: userJson.id,
-                username: userJson.username,
-                avatarColor: userJson.avatarColor,
-                isOnline: userJson.isOnline,
-                avatarText: avatarText(userJson.username),
-                lastMessage: lastMessageObj ? lastMessageObj.text : "No messages yet",
-                lastMessageTime: lastMessageObj ? lastMessageObj.createdAt : null,
-                unreadCount: calculatedUnreadCount
-            };
-        }));
+                io.emit('updateStatus', {
+                    userId,
+                    isOnline: false
+                });
 
-        res.status(200).json({ success: true, users: formattedUsers });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ success: false, error: "Internal server error" });
-    }
-});
-
-app.get('/chat/:userId/:friendId', async (req, res) => {
-    const { userId, friendId } = req.params;
-    try {
-        const history = await Messages.findAll({
-            where: {
-                senderId: [userId, friendId],
-                receiverId: [userId, friendId]
-            },
-            order: [['createdAt', 'ASC']]
-        });
-
-        await Messages.update(
-            { status: 'read' },
-            {
-                where: {
-                    senderId: friendId,
-                    receiverId: userId,
-                    status: { [Op.ne]: 'read' }
-                }
+                console.log(`User ${userId} Offline`);
             }
-        );
-        res.json({ success: true, data: history });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
+
+        } catch (err) {
+            console.error(err);
+        }
+
+        console.log('Disconnected:', socket.id);
+
+    });
+
 });
 
-const activeUsers = {};
-io.on('connection', (socket) => {
-    console.log(`the user has been connected with socket : `, socket.id)
-
-    socket.on('user_connected', (userId) => {
-        activeUsers[userId] = socket.id;
-        socket.userId = userId;
-        console.log(`User ${userId} Online.`);
-        io.emit('updateStatus', { userId: userId, isOnline: true });
-    });
-
-    socket.on('typing', (data) => {
-        const receiverSocketId = activeUsers[data.receiverId];
-        console.log("user typing...");
-        if (receiverSocketId) {
-            socket.to(receiverSocketId).emit('userTyping', {
-                senderId: data.senderId
-            });
-            console.log("friend typing...");
-        }
-    });
-
-    socket.on('send_message', async (newMsg) => {
-        const { senderId, receiverId, text } = newMsg;
-        await Messages.create({ senderId: senderId, receiverId: receiverId, text: text, status: 'sent' })
-
-        const history = await Messages.findAll({
-            where: {
-                senderId: [senderId, receiverId],
-                receiverId: [senderId, receiverId]
-            },
-            order: [['createdAt', 'ASC']]
-        });
-
-        socket.emit('updatehistory', history);
-        const socId = activeUsers[receiverId];
-        console.log('reciverId', socId);
-        socket.to(socId).emit('updatehistory', history)
-    })
-
-    socket.on('disconnect', () => {
-        const userId = socket.userId;
-        if (userId) {
-            delete activeUsers[userId];
-        }
-        io.emit('updateStatus', { userId: userId, isOnline: false });
-        console.log(`User ${socket.id} disconnected.`);
-    })
-})
-
-const PORT = 2323;
+const PORT = env.PORT || 2323;
 
 server.listen(PORT, () => {
     console.log(`server is running on port ${PORT}`)
